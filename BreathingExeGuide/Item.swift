@@ -1,18 +1,15 @@
-//
-//  Item.swift
-//  BreathingExeGuide
-//
-//  Created by Tam Le on 3/14/26.
-//
-
 import Foundation
 import SwiftData
 
 @Model
-final class Item {
-    var timestamp: Date
-    
-    init(timestamp: Date) {
-        self.timestamp = timestamp
+final class SessionRecord {
+    var sessionName: String
+    var completedAt: Date
+    var durationSeconds: Int
+
+    init(sessionName: String, completedAt: Date, durationSeconds: Int) {
+        self.sessionName = sessionName
+        self.completedAt = completedAt
+        self.durationSeconds = durationSeconds
     }
 }
