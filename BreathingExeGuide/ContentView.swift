@@ -1,7 +1,12 @@
 import SwiftUI
+import SwiftData
+import AudioToolbox
+import UIKit
+import AVFoundation
 
 struct ContentView: View {
     @State private var selectedTab: AppTab = .home
+    @State private var selectedSession: BreathingSession = .stressReset
     @State private var showSplash = true
     @State private var splashVisible = false
 
@@ -10,13 +15,14 @@ struct ContentView: View {
             BreathingBackground()
 
             TabView(selection: $selectedTab) {
-                HomeScreen(selectedTab: $selectedTab)
+                HomeScreen(selectedTab: $selectedTab, selectedSession: $selectedSession)
                     .tabItem {
                         Label("Home", systemImage: "house.fill")
                     }
                     .tag(AppTab.home)
 
-                LiveSessionScreen(session: BreathingSession.stressReset)
+                LiveSessionScreen(session: selectedSession)
+                    .id(selectedSession.id)
                     .tabItem {
                         Label("Sessions", systemImage: "waveform.path.ecg")
                     }
@@ -61,6 +67,12 @@ struct ContentView: View {
     }
 }
 
+private enum SettingsKeys {
+    static let soundEnabled = "settings.soundEnabled"
+    static let hapticsEnabled = "settings.hapticsEnabled"
+    static let voiceGuidanceEnabled = "settings.voiceGuidanceEnabled"
+}
+
 private enum AppTab {
     case home
     case sessions
@@ -70,6 +82,7 @@ private enum AppTab {
 
 private struct HomeScreen: View {
     @Binding var selectedTab: AppTab
+    @Binding var selectedSession: BreathingSession
 
     private let quickStarts: [QuickStart] = [
         QuickStart(title: "Calm", icon: "water.waves", session: .calmBreathing),
@@ -107,6 +120,7 @@ private struct HomeScreen: View {
                         HStack(spacing: 12) {
                             ForEach(quickStarts) { item in
                                 Button {
+                                    selectedSession = item.session
                                     selectedTab = .sessions
                                 } label: {
                                     VStack(alignment: .leading, spacing: 18) {
@@ -138,7 +152,13 @@ private struct HomeScreen: View {
                             .foregroundStyle(BreathingPalette.primaryText)
 
                         ForEach(sessions) { session in
-                            SessionCard(session: session)
+                            Button {
+                                selectedSession = session
+                                selectedTab = .sessions
+                            } label: {
+                                SessionCard(session: session)
+                            }
+                            .buttonStyle(.plain)
                         }
                     }
                 }
@@ -154,8 +174,14 @@ private struct HomeScreen: View {
 private struct HeroCard: View {
     var body: some View {
         VStack(spacing: 24) {
-            BreathingOrb(progress: HeroOrbMetrics.progress(at: Date()), phase: HeroOrbMetrics.phase(at: Date()), label: "Ready")
+            TimelineView(.animation(minimumInterval: 0.05)) { timeline in
+                BreathingOrb(
+                    progress: HeroOrbMetrics.progress(at: timeline.date),
+                    phase: HeroOrbMetrics.phase(at: timeline.date),
+                    label: "Ready"
+                )
                 .frame(height: 240)
+            }
 
             VStack(spacing: 8) {
                 Text("Start your calm in one tap")
@@ -236,19 +262,30 @@ private struct SessionCard: View {
 }
 
 private struct LiveSessionScreen: View {
+    @Environment(\.modelContext) private var modelContext
+    @AppStorage(SettingsKeys.soundEnabled) private var soundEnabled = true
+    @AppStorage(SettingsKeys.hapticsEnabled) private var hapticsEnabled = true
+    @AppStorage(SettingsKeys.voiceGuidanceEnabled) private var voiceGuidanceEnabled = false
     let session: BreathingSession
-    @State private var startDate = Date()
+    @State private var activeStartDate = Date()
+    @State private var elapsedBeforeCurrentRun: TimeInterval = 0
+    @State private var isPaused = false
+    @State private var isEnded = false
+    @State private var didPersistCompletion = false
+    @State private var lastCuePhase: BreathPhase?
+    private let speechSynthesizer = AVSpeechSynthesizer()
 
     var body: some View {
         NavigationStack {
             TimelineView(.animation(minimumInterval: 0.05)) { timeline in
-                let state = session.liveState(at: timeline.date, from: startDate)
+                let elapsed = elapsedTime(at: timeline.date)
+                let state = session.liveState(for: elapsed)
 
                 ScrollView(.vertical, showsIndicators: false) {
                     VStack(spacing: 28) {
                         HStack {
                             Button {
-                                startDate = Date()
+                                restartSession()
                             } label: {
                                 Image(systemName: "arrow.counterclockwise")
                                     .font(.system(size: 18, weight: .semibold))
@@ -270,8 +307,10 @@ private struct LiveSessionScreen: View {
 
                             Spacer()
 
-                            Button {} label: {
-                                Image(systemName: "pause.fill")
+                            Button {
+                                togglePause()
+                            } label: {
+                                Image(systemName: isPaused ? "play.fill" : "pause.fill")
                                     .font(.system(size: 18, weight: .semibold))
                                     .foregroundStyle(BreathingPalette.primaryText)
                                     .frame(width: 44, height: 44)
@@ -279,24 +318,69 @@ private struct LiveSessionScreen: View {
                             }
                         }
 
-                        BreathingOrb(progress: state.phaseProgress, phase: state.phase, label: state.phase.label)
+                        BreathingOrb(
+                            progress: state.phaseProgress,
+                            phase: state.phase,
+                            label: state.phase.label
+                        )
                             .frame(height: 360)
 
-                        VStack(spacing: 14) {
-                            Text(state.remainingLabel)
-                                .font(.system(size: 32, weight: .bold, design: .rounded))
-                                .foregroundStyle(BreathingPalette.primaryText)
+                        if isEnded {
+                            VStack(spacing: 12) {
+                                Text("Well done")
+                                    .font(.system(size: 30, weight: .bold, design: .rounded))
+                                    .foregroundStyle(BreathingPalette.primaryText)
+                                Text("You gave yourself \(session.durationLabel) of calm")
+                                    .font(.system(size: 16, weight: .medium, design: .rounded))
+                                    .foregroundStyle(BreathingPalette.secondaryText)
+                                Text("Come back anytime")
+                                    .font(.system(size: 14, weight: .medium, design: .rounded))
+                                    .foregroundStyle(BreathingPalette.secondaryText.opacity(0.9))
+                            }
+                        } else {
+                            VStack(spacing: 14) {
+                                Text(state.remainingLabel)
+                                    .font(.system(size: 32, weight: .bold, design: .rounded))
+                                    .foregroundStyle(BreathingPalette.primaryText)
 
-                            HStack(spacing: 18) {
-                                StatPill(title: "Cycle", value: "\(state.cycle)")
-                                StatPill(title: "Pattern", value: session.patternDescription)
+                                HStack(spacing: 18) {
+                                    StatPill(title: "Cycle", value: "\(state.cycle)")
+                                    StatPill(title: "Pattern", value: session.patternDescription)
+                                }
+
+                                if voiceGuidanceEnabled {
+                                    Text(state.phase.guidance)
+                                        .font(.system(size: 16, weight: .semibold, design: .rounded))
+                                        .foregroundStyle(state.phase.gradient[0].opacity(0.95))
+                                        .padding(.horizontal, 18)
+                                        .padding(.vertical, 12)
+                                        .background(
+                                            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                                                .fill(BreathingPalette.card.opacity(0.95))
+                                        )
+                                }
                             }
                         }
 
                         HStack(spacing: 12) {
-                            SessionControlButton(title: "Pause", systemImage: "pause.fill", tint: BreathingPalette.softBlue)
-                            SessionControlButton(title: "Restart", systemImage: "arrow.clockwise", tint: BreathingPalette.secondaryText)
-                            SessionControlButton(title: "End", systemImage: "xmark", tint: BreathingPalette.warmRed)
+                            SessionControlButton(
+                                title: isPaused ? "Resume" : "Pause",
+                                systemImage: isPaused ? "play.fill" : "pause.fill",
+                                tint: BreathingPalette.softBlue,
+                                action: togglePause
+                            )
+                            SessionControlButton(
+                                title: "Restart",
+                                systemImage: "arrow.clockwise",
+                                tint: BreathingPalette.secondaryText,
+                                action: restartSession
+                            )
+                            SessionControlButton(
+                                title: "End",
+                                systemImage: "xmark",
+                                tint: BreathingPalette.warmRed,
+                                action: { endSession() }
+                            )
                         }
                     }
                     .padding(.horizontal, 20)
@@ -304,19 +388,119 @@ private struct LiveSessionScreen: View {
                     .padding(.bottom, 120)
                 }
                 .scrollContentBackground(.hidden)
+                .onChange(of: state.isComplete) { _, isComplete in
+                    guard isComplete, !isEnded else { return }
+                    endSession(markComplete: true)
+                }
+                .onChange(of: state.phase) { _, phase in
+                    triggerPhaseCue(for: phase)
+                }
             }
         }
+        .onAppear {
+            lastCuePhase = nil
+        }
+    }
+
+    private func elapsedTime(at date: Date) -> TimeInterval {
+        if isEnded {
+            return TimeInterval(session.duration)
+        }
+
+        if isPaused {
+            return elapsedBeforeCurrentRun
+        }
+
+        return elapsedBeforeCurrentRun + max(0, date.timeIntervalSince(activeStartDate))
+    }
+
+    private func togglePause() {
+        guard !isEnded else {
+            restartSession()
+            return
+        }
+
+        if isPaused {
+            activeStartDate = Date()
+            isPaused = false
+        } else {
+            elapsedBeforeCurrentRun += max(0, Date().timeIntervalSince(activeStartDate))
+            isPaused = true
+        }
+    }
+
+    private func restartSession() {
+        elapsedBeforeCurrentRun = 0
+        activeStartDate = Date()
+        isPaused = false
+        isEnded = false
+        didPersistCompletion = false
+        lastCuePhase = nil
+    }
+
+    private func endSession(markComplete: Bool = false) {
+        if markComplete {
+            elapsedBeforeCurrentRun = TimeInterval(session.duration)
+            persistCompletedSessionIfNeeded()
+        } else if !isPaused {
+            elapsedBeforeCurrentRun = min(
+                elapsedBeforeCurrentRun + max(0, Date().timeIntervalSince(activeStartDate)),
+                TimeInterval(session.duration)
+            )
+        }
+        isPaused = true
+        isEnded = true
+    }
+
+    private func persistCompletedSessionIfNeeded() {
+        guard !didPersistCompletion else { return }
+
+        let record = SessionRecord(
+            sessionName: session.name,
+            completedAt: .now,
+            durationSeconds: session.duration
+        )
+        modelContext.insert(record)
+        didPersistCompletion = true
+    }
+
+    private func triggerPhaseCue(for phase: BreathPhase) {
+        guard !isPaused, !isEnded, lastCuePhase != phase else { return }
+        lastCuePhase = phase
+
+        if voiceGuidanceEnabled {
+            speak(phase.guidance)
+        }
+
+        if hapticsEnabled {
+            UIImpactFeedbackGenerator(style: .soft).impactOccurred(intensity: 0.8)
+        }
+
+        if soundEnabled {
+            AudioServicesPlaySystemSound(1113)
+        }
+    }
+
+    private func speak(_ phrase: String) {
+        if speechSynthesizer.isSpeaking {
+            speechSynthesizer.stopSpeaking(at: .immediate)
+        }
+
+        let utterance = AVSpeechUtterance(string: phrase)
+        utterance.rate = 0.42
+        utterance.pitchMultiplier = 0.92
+        utterance.volume = 0.8
+        utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
+        speechSynthesizer.speak(utterance)
     }
 }
 
 private struct ProgressScreen: View {
-    private let stats: [ProgressStat] = [
-        ProgressStat(title: "7-day streak", value: "7", detail: "Daily breath sessions"),
-        ProgressStat(title: "Minutes this week", value: "42", detail: "Steady calm practice"),
-        ProgressStat(title: "Sessions completed", value: "12", detail: "Most used: Box Breathing")
-    ]
+    @Query(sort: \SessionRecord.completedAt, order: .reverse) private var records: [SessionRecord]
 
     var body: some View {
+        let summary = ProgressSummary(records: records)
+
         NavigationStack {
             ScrollView(.vertical, showsIndicators: false) {
                 VStack(alignment: .leading, spacing: 18) {
@@ -324,7 +508,7 @@ private struct ProgressScreen: View {
                         .font(.system(size: 32, weight: .bold, design: .rounded))
                         .foregroundStyle(BreathingPalette.primaryText)
 
-                    ForEach(stats) { stat in
+                    ForEach(summary.stats) { stat in
                         VStack(alignment: .leading, spacing: 8) {
                             Text(stat.title.uppercased())
                                 .font(.system(size: 12, weight: .bold, design: .rounded))
@@ -361,19 +545,21 @@ private struct ProgressScreen: View {
                             .foregroundStyle(BreathingPalette.primaryText)
 
                         HStack(alignment: .bottom, spacing: 12) {
-                            ForEach(Array([0.35, 0.5, 0.42, 0.7, 0.82, 0.74, 0.9].enumerated()), id: \.offset) { index, height in
+                            ForEach(Array(summary.weeklyBars.enumerated()), id: \.offset) { index, value in
                                 RoundedRectangle(cornerRadius: 12, style: .continuous)
                                     .fill(
                                         LinearGradient(
-                                            colors: index < 4
+                                            colors: value > 0 && index < 4
                                                 ? [BreathingPalette.deepBlue, BreathingPalette.softBlue]
-                                                : [BreathingPalette.warmRed.opacity(0.8), BreathingPalette.softRed],
+                                                : value > 0
+                                                ? [BreathingPalette.warmRed.opacity(0.8), BreathingPalette.softRed]
+                                                : [BreathingPalette.card.opacity(0.8), BreathingPalette.card],
                                             startPoint: .bottom,
                                             endPoint: .top
                                         )
                                     )
                                     .frame(maxWidth: .infinity)
-                                    .frame(height: 140 * height)
+                                    .frame(height: max(18, 140 * value))
                             }
                         }
                         .frame(height: 150, alignment: .bottom)
@@ -394,10 +580,9 @@ private struct ProgressScreen: View {
 }
 
 private struct SettingsScreen: View {
-    @State private var soundEnabled = true
-    @State private var hapticsEnabled = true
-    @State private var voiceGuidance = false
-    @State private var themeIntensity = 0.65
+    @AppStorage(SettingsKeys.soundEnabled) private var soundEnabled = true
+    @AppStorage(SettingsKeys.hapticsEnabled) private var hapticsEnabled = true
+    @AppStorage(SettingsKeys.voiceGuidanceEnabled) private var voiceGuidance = false
 
     var body: some View {
         NavigationStack {
@@ -410,22 +595,6 @@ private struct SettingsScreen: View {
                     SettingsToggleRow(title: "Sound", subtitle: "Soft tones at each phase change", isOn: $soundEnabled)
                     SettingsToggleRow(title: "Haptics", subtitle: "Gentle taps for inhale and exhale", isOn: $hapticsEnabled)
                     SettingsToggleRow(title: "Voice Guidance", subtitle: "Spoken inhale, hold, exhale cues", isOn: $voiceGuidance)
-
-                    VStack(alignment: .leading, spacing: 14) {
-                        Text("Theme intensity")
-                            .font(.system(size: 18, weight: .semibold, design: .rounded))
-                            .foregroundStyle(BreathingPalette.primaryText)
-                        Slider(value: $themeIntensity, in: 0.2...1.0)
-                            .tint(BreathingPalette.softBlue)
-                        Text("Adjust the strength of the blue and red glow.")
-                            .font(.system(size: 14, weight: .medium, design: .rounded))
-                            .foregroundStyle(BreathingPalette.secondaryText)
-                    }
-                    .padding(22)
-                    .background(
-                        RoundedRectangle(cornerRadius: 26, style: .continuous)
-                            .fill(BreathingPalette.card.opacity(0.92))
-                    )
                 }
                 .padding(.horizontal, 20)
                 .padding(.top, 20)
@@ -518,17 +687,18 @@ private struct BreathingOrb: View {
     var body: some View {
         let scale = phase.scale(for: progress)
         let colors = phase.gradient
+        let clampedIntensity = 0.65
 
         return ZStack {
             Circle()
-                .fill(colors[0].opacity(0.24))
-                .blur(radius: 42)
+                .fill(colors[0].opacity(0.18 + (0.18 * clampedIntensity)))
+                .blur(radius: 30 + (28 * clampedIntensity))
                 .frame(width: 240, height: 240)
                 .scaleEffect(scale * 1.18)
 
             Circle()
-                .fill(colors[1].opacity(0.18))
-                .blur(radius: 58)
+                .fill(colors[1].opacity(0.12 + (0.16 * clampedIntensity)))
+                .blur(radius: 38 + (34 * clampedIntensity))
                 .frame(width: 280, height: 280)
                 .scaleEffect(scale * 1.08)
 
@@ -546,7 +716,12 @@ private struct BreathingOrb: View {
                 }
                 .frame(width: 208, height: 208)
                 .scaleEffect(scale)
-                .shadow(color: colors[0].opacity(0.45), radius: 26, x: 0, y: 18)
+                .shadow(
+                    color: colors[0].opacity(0.2 + (0.45 * clampedIntensity)),
+                    radius: 18 + (18 * clampedIntensity),
+                    x: 0,
+                    y: 18
+                )
 
             VStack(spacing: 8) {
                 Text(label)
@@ -584,9 +759,10 @@ private struct SessionControlButton: View {
     let title: String
     let systemImage: String
     let tint: Color
+    let action: () -> Void
 
     var body: some View {
-        Button {} label: {
+        Button(action: action) {
             HStack(spacing: 8) {
                 Image(systemName: systemImage)
                 Text(title)
@@ -689,6 +865,99 @@ private struct ProgressStat: Identifiable {
     let detail: String
 }
 
+private struct ProgressSummary {
+    let stats: [ProgressStat]
+    let weeklyBars: [Double]
+
+    init(records: [SessionRecord], calendar: Calendar = .current, now: Date = .now) {
+        let totalSessions = records.count
+        let totalMinutes = records.reduce(0) { $0 + ($1.durationSeconds / 60) }
+        let currentStreak = Self.currentStreak(for: records, calendar: calendar, now: now)
+        let mostUsed = Self.mostUsedSessionName(from: records)
+        let thisWeekMinutes = Self.minutesThisWeek(from: records, calendar: calendar, now: now)
+
+        stats = [
+            ProgressStat(
+                title: "Current streak",
+                value: "\(currentStreak)",
+                detail: currentStreak == 1 ? "1 day of steady breathing" : "\(currentStreak) consecutive days of steady breathing"
+            ),
+            ProgressStat(
+                title: "Minutes this week",
+                value: "\(thisWeekMinutes)",
+                detail: totalMinutes == 0 ? "Complete a session to start tracking" : "\(totalMinutes) total minutes across all sessions"
+            ),
+            ProgressStat(
+                title: "Sessions completed",
+                value: "\(totalSessions)",
+                detail: "Most used: \(mostUsed)"
+            )
+        ]
+        weeklyBars = Self.weeklyBarValues(from: records, calendar: calendar, now: now)
+    }
+
+    private static func currentStreak(for records: [SessionRecord], calendar: Calendar, now: Date) -> Int {
+        let days = Set(records.map { calendar.startOfDay(for: $0.completedAt) })
+        guard !days.isEmpty else { return 0 }
+
+        var streak = 0
+        var day = calendar.startOfDay(for: now)
+
+        if !days.contains(day),
+           let yesterday = calendar.date(byAdding: .day, value: -1, to: day),
+           days.contains(yesterday) {
+            day = yesterday
+        }
+
+        while days.contains(day) {
+            streak += 1
+            guard let previous = calendar.date(byAdding: .day, value: -1, to: day) else { break }
+            day = previous
+        }
+
+        return streak
+    }
+
+    private static func minutesThisWeek(from records: [SessionRecord], calendar: Calendar, now: Date) -> Int {
+        guard let weekInterval = calendar.dateInterval(of: .weekOfYear, for: now) else { return 0 }
+
+        return records
+            .filter { weekInterval.contains($0.completedAt) }
+            .reduce(0) { $0 + ($1.durationSeconds / 60) }
+    }
+
+    private static func mostUsedSessionName(from records: [SessionRecord]) -> String {
+        let counts = records.reduce(into: [String: Int]()) { partialResult, record in
+            partialResult[record.sessionName, default: 0] += 1
+        }
+
+        return counts.max { lhs, rhs in
+            if lhs.value == rhs.value {
+                return lhs.key > rhs.key
+            }
+            return lhs.value < rhs.value
+        }?.key ?? "No sessions yet"
+    }
+
+    private static func weeklyBarValues(from records: [SessionRecord], calendar: Calendar, now: Date) -> [Double] {
+        let today = calendar.startOfDay(for: now)
+        let dailyMinutes: [Date: Int] = records.reduce(into: [:]) { partialResult, record in
+            let day = calendar.startOfDay(for: record.completedAt)
+            partialResult[day, default: 0] += record.durationSeconds / 60
+        }
+
+        let days: [Date] = (0..<7).compactMap { offset in
+            calendar.date(byAdding: .day, value: -(6 - offset), to: today).map { calendar.startOfDay(for: $0) }
+        }
+
+        let maxMinutes = max(dailyMinutes.values.max() ?? 0, 1)
+
+        return days.map { day in
+            Double(dailyMinutes[day, default: 0]) / Double(maxMinutes)
+        }
+    }
+}
+
 private struct BreathingSession: Identifiable {
     let id = UUID()
     let name: String
@@ -707,9 +976,12 @@ private struct BreathingSession: Identifiable {
     }
 
     func liveState(at date: Date, from startDate: Date) -> LiveSessionState {
-        let elapsed = max(0, date.timeIntervalSince(startDate))
+        liveState(for: max(0, date.timeIntervalSince(startDate)))
+    }
+
+    func liveState(for elapsed: TimeInterval) -> LiveSessionState {
         let totalDuration = Double(duration)
-        let clampedElapsed = min(elapsed, totalDuration)
+        let clampedElapsed = min(max(0, elapsed), totalDuration)
         let cycleDuration = pattern.reduce(0) { $0 + $1.seconds }
         let progressInCycle = cycleDuration == 0 ? 0 : clampedElapsed.truncatingRemainder(dividingBy: cycleDuration)
         var running = progressInCycle
@@ -731,7 +1003,8 @@ private struct BreathingSession: Identifiable {
             phase: active.phase,
             phaseProgress: phaseProgress,
             remainingLabel: String(format: "%d:%02d remaining", remaining / 60, remaining % 60),
-            cycle: cycle
+            cycle: cycle,
+            isComplete: clampedElapsed >= totalDuration
         )
     }
 
@@ -805,6 +1078,7 @@ private struct LiveSessionState {
     let phaseProgress: Double
     let remainingLabel: String
     let cycle: Int
+    let isComplete: Bool
 }
 
 private struct BreathSegment {
@@ -840,6 +1114,15 @@ private enum BreathPhase {
         }
     }
 
+    var guidance: String {
+        switch self {
+        case .inhale: "Inhale slowly"
+        case .hold: "Hold gently"
+        case .exhale: "Exhale fully"
+        case .rest: "Let go"
+        }
+    }
+
     var gradient: [Color] {
         switch self {
         case .inhale:
@@ -855,7 +1138,7 @@ private enum BreathPhase {
 
     func scale(for progress: Double) -> Double {
         let eased = 0.5 - 0.5 * cos(progress * .pi)
-        switch self {
+        return switch self {
         case .inhale:
             0.84 + (eased * 0.28)
         case .hold:
@@ -896,4 +1179,5 @@ private extension Color {
 
 #Preview {
     ContentView()
+        .modelContainer(for: SessionRecord.self, inMemory: true)
 }
