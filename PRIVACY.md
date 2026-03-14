@@ -49,4 +49,4 @@ The app is not intended to knowingly collect personal information from children.
 
 If you have questions about this Privacy Policy, contact:
 
-support@breathingexeguide.app
+datamuse.ai@gmail.com
